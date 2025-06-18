@@ -1,9 +1,15 @@
 package src;
 
+import java.security.KeyFactory;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
 import java.util.Scanner;
 import java.security.PublicKey;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import utils.RSAUtils;
+import utils.SerializationUtils;
 
 public class Main {
     private ChatClient client;
@@ -18,12 +24,19 @@ public class Main {
         client = new ChatClient();
 
         try {
-            client.start(); // Connect and set username
-            System.out.print("[" + client.getUsername() + "]: "); // Initial prompt after start
+            client.start();
+            synchronized (System.out) {
+                System.out.print("[" + client.getUsername() + "]: ");
+                System.out.flush();
+            }
             new Thread(this::receiveMessages).start();
             handleConsoleInput();
         } catch (Exception e) {
-            System.out.println("[!] Error: " + e.getMessage());
+            synchronized (System.out) {
+                System.out.println("\r[!] Error: " + e.getMessage());
+                System.out.print("[" + client.getUsername() + "]: ");
+                System.out.flush();
+            }
         } finally {
             try {
                 client.close();
@@ -35,55 +48,81 @@ public class Main {
         try {
             while (true) {
                 ChatMessage msg = client.receiveMessage();
-                if (msg.getType() == ChatMessage.MessageType.ENCRYPTED_TEXT) {
-                    String decrypted = RSAUtils.decrypt(msg.getMessage(), client.getPrivateKey());
-                    System.out.println("\r[" + msg.getSender() + "]: " + decrypted);
-                    System.out.print("[" + client.getUsername() + "]: ");
-                } else if (msg.getType() == ChatMessage.MessageType.TEXT) {
-                    System.out.println("\r" + msg.getMessage());
-                    System.out.print("[" + client.getUsername() + "]: ");
+                synchronized (System.out) {
+                    if (msg.getType() == ChatMessage.MessageType.ENCRYPTED_TEXT) {
+                        Map<String, String> encryptedMap = SerializationUtils.deserialize(msg.getMessage());
+                        String encryptedMessage = encryptedMap.get(client.getUsername());
+                        if (encryptedMessage != null) {
+                            String decrypted = RSAUtils.decrypt(encryptedMessage, client.getPrivateKey());
+                            System.out.println("\r[" + msg.getSender() + "]: " + decrypted);
+                        }
+                        // Skip prompt if the message is from self to avoid double prompt
+                        if (!msg.getSender().equals(client.getUsername())) {
+                            System.out.print("[" + client.getUsername() + "]: ");
+                            System.out.flush();
+                        }
+                    } else if (msg.getType() == ChatMessage.MessageType.TEXT) {
+                        System.out.println("\r" + msg.getMessage());
+                        System.out.print("[" + client.getUsername() + "]: ");
+                        System.out.flush();
+                    } else if (msg.getType() == ChatMessage.MessageType.PUBLIC_KEY_MAP) {
+                        Map<String, String> keyStrings = SerializationUtils.deserialize(msg.getMessage());
+                        for (Map.Entry<String, String> entry : keyStrings.entrySet()) {
+                            byte[] keyBytes = Base64.getDecoder().decode(entry.getValue());
+                            X509EncodedKeySpec spec = new X509EncodedKeySpec(keyBytes);
+                            KeyFactory kf = KeyFactory.getInstance("RSA");
+                            client.getPublicKeys().put(entry.getKey(), kf.generatePublic(spec));
+                        }
+                        System.out.println("\r[*] Updated public key map.");
+                        System.out.print("[" + client.getUsername() + "]: ");
+                        System.out.flush();
+                    }
                 }
             }
         } catch (Exception e) {
-            System.out.println("\r[!] Connection lost: " + e.getMessage());
+            synchronized (System.out) {
+                System.out.println("\r[!] Connection lost: " + e.getMessage());
+                System.out.print("[" + client.getUsername() + "]: ");
+                System.out.flush();
+            }
         }
     }
 
     private void handleConsoleInput() {
         while (true) {
-            String input = scanner.nextLine();
+            String input;
+            synchronized (scanner) {
+                input = scanner.nextLine();
+            }
             try {
-                if (input.startsWith("/send")) {
-                    handleSendCommand(input);
-                } else if (input.equalsIgnoreCase("/exit")) {
+                if (input.equalsIgnoreCase("/exit")) {
                     client.sendMessage(new ChatMessage(client.getUsername(), null, "/disconnect", ChatMessage.MessageType.TEXT));
                     break;
+                } else if (input.trim().isEmpty()) {
+                    continue;
                 } else {
-                    System.out.println("[!] Unknown command. Use /send <recipient> <message> or /exit");
+                    Map<String, String> encryptedMap = new HashMap<>();
+                    for (Map.Entry<String, PublicKey> entry : client.getPublicKeys().entrySet()) {
+                        String recipient = entry.getKey();
+                        if (!recipient.equals(client.getUsername())) {
+                            String encrypted = RSAUtils.encrypt(input, entry.getValue());
+                            encryptedMap.put(recipient, encrypted);
+                        }
+                    }
+                    String serialized = SerializationUtils.serialize(encryptedMap);
+                    client.sendMessage(new ChatMessage(client.getUsername(), null, serialized, ChatMessage.MessageType.ENCRYPTED_TEXT));
                 }
             } catch (Exception e) {
-                System.out.println("[!] Error: " + e.getMessage());
+                synchronized (System.out) {
+                    System.out.println("\r[!] Error: " + e.getMessage());
+                    System.out.print("[" + client.getUsername() + "]: ");
+                    System.out.flush();
+                }
             }
-            System.out.print("[" + client.getUsername() + "]: ");
-        }
-    }
-
-    private void handleSendCommand(String input) throws Exception {
-        String[] parts = input.split("\\s+", 3);
-        if (parts.length < 3) {
-            System.out.println("[!] Usage: /send <recipient> <message>");
-            return;
-        }
-        String recipient = parts[1];
-        String message = parts[2];
-
-        PublicKey publicKey = client.requestPublicKey(recipient);
-        if (publicKey != null) {
-            String encrypted = RSAUtils.encrypt(message, publicKey);
-            client.sendMessage(new ChatMessage(client.getUsername(), recipient, encrypted, ChatMessage.MessageType.ENCRYPTED_TEXT));
-            System.out.println("[+] Message sent to " + recipient);
-        } else {
-            System.out.println("[!] Failed to send message: User " + recipient + " not found or public key unavailable");
+            synchronized (System.out) {
+                System.out.print("[" + client.getUsername() + "]: ");
+                System.out.flush();
+            }
         }
     }
 }

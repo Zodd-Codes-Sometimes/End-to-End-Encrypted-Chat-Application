@@ -3,8 +3,11 @@ package src;
 import java.io.*;
 import java.net.*;
 import java.security.*;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import utils.RSAUtils;
+import utils.SerializationUtils;
+import java.util.Base64;
 
 public class ChatClient {
     private Socket socket;
@@ -33,6 +36,7 @@ public class ChatClient {
                 String ip = scanner.nextLine();
                 socket = new Socket(ip, 9001);
                 out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();
                 in = new ObjectInputStream(socket.getInputStream());
 
                 ChatMessage msg = (ChatMessage) in.readObject();
@@ -41,13 +45,38 @@ public class ChatClient {
                 while (true) {
                     System.out.print("Enter username: ");
                     username = scanner.nextLine().replaceAll("\\s+", "-");
-                    out.writeObject(username);
+                    // Validate username client-side
+                    if (username == null || username.trim().isEmpty()) {
+                        System.out.println("[!] Username cannot be empty. Try again.");
+                        continue;
+                    }
+                    synchronized (out) {
+                        out.writeObject(username);
+                        out.flush();
+                    }
                     ChatMessage response = (ChatMessage) in.readObject();
                     System.out.println(response.getMessage());
                     if (response.getMessage().startsWith("[*] Username accepted")) break;
                 }
 
-                out.writeObject(new ChatMessage(username, keyPair.getPublic()));
+                synchronized (out) {
+                    out.writeObject(new ChatMessage(username, keyPair.getPublic()));
+                    out.flush();
+                }
+
+                ChatMessage keyMapMsg = (ChatMessage) in.readObject();
+                if (keyMapMsg.getType() == ChatMessage.MessageType.PUBLIC_KEY_MAP) {
+                    Map<String, String> keyStrings = SerializationUtils.deserialize(keyMapMsg.getMessage());
+                    for (Map.Entry<String, String> entry : keyStrings.entrySet()) {
+                        byte[] keyBytes = Base64.getDecoder().decode(entry.getValue());
+                        X509EncodedKeySpec spec = new X509EncodedKeySpec(keyBytes);
+                        KeyFactory kf = KeyFactory.getInstance("RSA");
+                        publicKeys.put(entry.getKey(), kf.generatePublic(spec));
+                    }
+                } else {
+                    throw new IOException("Expected public key map");
+                }
+
                 return;
 
             } catch (Exception e) {
@@ -63,21 +92,43 @@ public class ChatClient {
 
     public void start(String ip, int port, String username) throws Exception {
         this.username = username.replaceAll("\\s+", "-");
+        if (this.username == null || this.username.trim().isEmpty()) {
+            throw new Exception("[!] Username cannot be empty.");
+        }
         int attempts = 0;
         while (attempts < 3) {
             try {
                 socket = new Socket(ip, port);
                 out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();
                 in = new ObjectInputStream(socket.getInputStream());
 
                 ChatMessage msg = (ChatMessage) in.readObject();
                 System.out.println(msg.getMessage());
 
-                out.writeObject(this.username);
+                synchronized (out) {
+                    out.writeObject(this.username);
+                    out.flush();
+                }
                 ChatMessage response = (ChatMessage) in.readObject();
                 System.out.println(response.getMessage());
                 if (response.getMessage().startsWith("[*] Username accepted")) {
-                    out.writeObject(new ChatMessage(this.username, keyPair.getPublic()));
+                    synchronized (out) {
+                        out.writeObject(new ChatMessage(this.username, keyPair.getPublic()));
+                        out.flush();
+                    }
+                    ChatMessage keyMapMsg = (ChatMessage) in.readObject();
+                    if (keyMapMsg.getType() == ChatMessage.MessageType.PUBLIC_KEY_MAP) {
+                        Map<String, String> keyStrings = SerializationUtils.deserialize(keyMapMsg.getMessage());
+                        for (Map.Entry<String, String> entry : keyStrings.entrySet()) {
+                            byte[] keyBytes = Base64.getDecoder().decode(entry.getValue());
+                            X509EncodedKeySpec spec = new X509EncodedKeySpec(keyBytes);
+                            KeyFactory kf = KeyFactory.getInstance("RSA");
+                            publicKeys.put(entry.getKey(), kf.generatePublic(spec));
+                        }
+                    } else {
+                        throw new IOException("Expected public key map");
+                    }
                     return;
                 }
                 attempts++;
@@ -93,8 +144,10 @@ public class ChatClient {
     }
 
     public void sendMessage(ChatMessage message) throws IOException {
-        out.writeObject(message);
-        out.flush();
+        synchronized (out) {
+            out.writeObject(message);
+            out.flush();
+        }
     }
 
     public ChatMessage receiveMessage() throws Exception {
@@ -110,21 +163,8 @@ public class ChatClient {
         }
     }
 
-    public PublicKey requestPublicKey(String recipient) throws Exception {
-        if (publicKeys.containsKey(recipient)) {
-            return publicKeys.get(recipient);
-        }
-
-        out.writeObject(new ChatMessage(username, recipient, ChatMessage.MessageType.KEY_REQUEST));
-        ChatMessage response = (ChatMessage) in.readObject();
-
-        if (response.getType() == ChatMessage.MessageType.PUBLIC_KEY) {
-            publicKeys.put(response.getSender(), response.getPublicKey());
-            return response.getPublicKey();
-        } else {
-            System.out.println(response.getMessage());
-            return null;
-        }
+    public Map<String, PublicKey> getPublicKeys() {
+        return publicKeys;
     }
 
     public String getUsername() {

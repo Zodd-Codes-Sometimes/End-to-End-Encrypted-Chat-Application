@@ -5,6 +5,9 @@ import java.net.*;
 import java.security.PublicKey;
 import java.util.*;
 import java.util.concurrent.*;
+import utils.SerializationUtils;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
 
 public class ChatServer {
     private static final int DEFAULT_PORT = 9001;
@@ -55,15 +58,23 @@ public class ChatServer {
                 in = new ObjectInputStream(socket.getInputStream());
 
                 out.writeObject(new ChatMessage("Server", null, "[*] Connection acknowledged by ChatServer", ChatMessage.MessageType.TEXT));
+                out.flush();
 
                 while (true) {
                     String requestedUsername = ((String) in.readObject()).replaceAll("\\s+", "-");
+                    if (requestedUsername == null || requestedUsername.trim().isEmpty()) {
+                        out.writeObject(new ChatMessage("Server", null, "[!] Username cannot be empty. Try again.", ChatMessage.MessageType.TEXT));
+                        out.flush();
+                        continue;
+                    }
                     if (!clients.containsKey(requestedUsername)) {
                         username = requestedUsername;
                         out.writeObject(new ChatMessage("Server", null, "[*] Username accepted: " + username, ChatMessage.MessageType.TEXT));
+                        out.flush();
                         break;
                     } else {
                         out.writeObject(new ChatMessage("Server", null, "[!] Username taken. Try again or use: " + requestedUsername + new Random().nextInt(100), ChatMessage.MessageType.TEXT));
+                        out.flush();
                     }
                 }
 
@@ -72,6 +83,19 @@ public class ChatServer {
                     throw new IOException("Expected public key");
                 }
                 clients.put(username, new ClientInfo(out, keyMsg.getPublicKey()));
+
+                // Convert public keys to Base64-encoded strings
+                Map<String, String> publicKeyStrings = new HashMap<>();
+                for (Map.Entry<String, ClientInfo> entry : clients.entrySet()) {
+                    String keyEncoded = Base64.getEncoder().encodeToString(entry.getValue().publicKey.getEncoded());
+                    publicKeyStrings.put(entry.getKey(), keyEncoded);
+                }
+                String serializedKeys = SerializationUtils.serialize(publicKeyStrings);
+                out.writeObject(new ChatMessage("Server", null, serializedKeys, ChatMessage.MessageType.PUBLIC_KEY_MAP));
+                out.flush();
+
+                // Broadcast updated public key map to all clients
+                broadcast(new ChatMessage("Server", null, serializedKeys, ChatMessage.MessageType.PUBLIC_KEY_MAP), username);
                 broadcast(new ChatMessage("Server", null, "[*] User " + username + " has joined the chat.", ChatMessage.MessageType.TEXT), null);
 
                 Object inputObj;
@@ -79,30 +103,28 @@ public class ChatServer {
                     ChatMessage msg = (ChatMessage) inputObj;
                     if (msg.getMessage() != null && msg.getMessage().equalsIgnoreCase("/disconnect")) {
                         out.writeObject(new ChatMessage("Server", null, "[*] Disconnected from the ChatServer successfully", ChatMessage.MessageType.TEXT));
+                        out.flush();
                         break;
-                    } else if (msg.getType() == ChatMessage.MessageType.KEY_REQUEST) {
-                        String requestedUser = msg.getRecipient();
-                        ClientInfo info = clients.get(requestedUser);
-                        if (info != null) {
-                            out.writeObject(new ChatMessage(requestedUser, info.publicKey));
-                        } else {
-                            out.writeObject(new ChatMessage("Server", null, "[!] User not found: " + requestedUser, ChatMessage.MessageType.TEXT));
-                        }
-                    } else if (msg.getType() == ChatMessage.MessageType.ENCRYPTED_TEXT) {
-                        ClientInfo recipientInfo = clients.get(msg.getRecipient());
-                        if (recipientInfo != null) {
-                            recipientInfo.out.writeObject(msg);
-                        }
                     } else {
-                        broadcast(msg, msg.getSender());
+                        broadcast(msg, null);
                     }
                 }
-            } catch (Exception e) {
+            } catch (IOException e) {
                 System.err.println("[Server] Client error: " + (username != null ? username : "unknown") + ": " + e.getMessage());
+            } catch (ClassNotFoundException e) {
+                System.err.println("[Server] Deserialization error for " + (username != null ? username : "unknown") + ": " + e.getMessage());
             } finally {
                 try {
                     if (username != null) {
                         clients.remove(username);
+                        // Update public key map for remaining clients
+                        Map<String, String> publicKeyStrings = new HashMap<>();
+                        for (Map.Entry<String, ClientInfo> entry : clients.entrySet()) {
+                            String keyEncoded = Base64.getEncoder().encodeToString(entry.getValue().publicKey.getEncoded());
+                            publicKeyStrings.put(entry.getKey(), keyEncoded);
+                        }
+                        String serializedKeys = SerializationUtils.serialize(publicKeyStrings);
+                        broadcast(new ChatMessage("Server", null, serializedKeys, ChatMessage.MessageType.PUBLIC_KEY_MAP), null);
                         broadcast(new ChatMessage("Server", null, "[*] User " + username + " has left.", ChatMessage.MessageType.TEXT), null);
                     }
                     socket.close();
@@ -111,12 +133,34 @@ public class ChatServer {
         }
 
         private void broadcast(ChatMessage message, String excludeUser) {
-            for (Map.Entry<String, ClientInfo> entry : clients.entrySet()) {
-                if (!entry.getKey().equals(excludeUser)) {
-                    try {
-                        entry.getValue().out.writeObject(message);
-                    } catch (IOException ignored) {}
+            List<String> failedClients = new ArrayList<>();
+            synchronized (clients) {
+                for (Map.Entry<String, ClientInfo> entry : clients.entrySet()) {
+                    if (excludeUser == null || !entry.getKey().equals(excludeUser)) {
+                        try {
+                            synchronized (entry.getValue().out) {
+                                entry.getValue().out.writeObject(message);
+                                entry.getValue().out.flush();
+                            }
+                        } catch (IOException e) {
+                            System.err.println("[Server] Failed to send to " + entry.getKey() + ": " + e.getMessage());
+                            failedClients.add(entry.getKey());
+                        }
+                    }
                 }
+            }
+            for (String client : failedClients) {
+                clients.remove(client);
+                try {
+                    Map<String, String> publicKeyStrings = new HashMap<>();
+                    for (Map.Entry<String, ClientInfo> entry : clients.entrySet()) {
+                        String keyEncoded = Base64.getEncoder().encodeToString(entry.getValue().publicKey.getEncoded());
+                        publicKeyStrings.put(entry.getKey(), keyEncoded);
+                    }
+                    String serializedKeys = SerializationUtils.serialize(publicKeyStrings);
+                    broadcast(new ChatMessage("Server", null, serializedKeys, ChatMessage.MessageType.PUBLIC_KEY_MAP), null);
+                    broadcast(new ChatMessage("Server", null, "[*] User " + client + " has disconnected unexpectedly.", ChatMessage.MessageType.TEXT), null);
+                } catch (IOException ignored) {}
             }
         }
     }

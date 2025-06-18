@@ -11,7 +11,7 @@ public class ChatMessage implements Serializable {
     private final PublicKey publicKey; // For key exchange messages
 
     public enum MessageType {
-        TEXT, ENCRYPTED_TEXT, PUBLIC_KEY, KEY_REQUEST
+        TEXT, ENCRYPTED_TEXT, PUBLIC_KEY, KEY_REQUEST, PUBLIC_KEY_MAP
     }
 
     // Constructor for text/encrypted messages
@@ -70,5 +70,4 @@ public class ChatMessage implements Serializable {
     public PublicKey getPublicKey() {
         return publicKey;
     }
-
 }
